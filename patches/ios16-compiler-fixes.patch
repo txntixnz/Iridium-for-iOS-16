@@ -130,3 +130,98 @@
  schemes:
    IridiumIOS16Compile:
      build:
+--- a/iridium/apps/ios/Iridium/Views/RuntimeLaunchArtworkView.swift
++++ b/iridium/apps/ios/Iridium/Views/RuntimeLaunchArtworkView.swift
+@@ -76,7 +76,7 @@
+                     .padding(.bottom, safeInsets.bottom + 24)
+                     .frame(minHeight: bounds.height, alignment: .topLeading)
+                 }
+-                .scrollBounceBehavior(.basedOnSize)
++                .iridiumScrollBounceBasedOnSize()
+             }
+             .coordinateSpace(name: "launchWindow")
+             .foregroundStyle(.white)
+@@ -90,12 +90,7 @@
+             .lineLimit(typeSize.isAccessibilitySize ? nil : 1)
+             .truncationMode(.tail)
+             .frame(maxWidth: .infinity, alignment: .leading)
+-            .visualEffect { content, geometry in
+-                let target = geometry.frame(in: .named("launchWindow"))
+-                let start = source ?? target
+-                return content.offset(x: motion ? start.minX - target.minX : 0,
+-                                      y: motion ? start.minY - target.minY : 0)
+-            }
++            .iridiumLaunchTransition(from: source, motion: motion)
+             .accessibilityAddTraits(.isHeader)
+             .accessibilityIdentifier("playerLaunchTitle")
+     }
+@@ -105,15 +100,7 @@
+         ArtworkImage(image: cover, title: "", position: artwork.coverY, fit: artwork.coverFits)
+             .frame(width: width, height: height)
+             .clipShape(RoundedRectangle(cornerRadius: 14))
+-            .visualEffect { content, geometry in
+-                let target = geometry.frame(in: .named("launchWindow"))
+-                let start = source ?? target
+-                return content.scaleEffect(x: motion ? start.width / max(1, target.width) : 1,
+-                                           y: motion ? start.height / max(1, target.height) : 1,
+-                                           anchor: .topLeading)
+-                    .offset(x: motion ? start.minX - target.minX : 0,
+-                            y: motion ? start.minY - target.minY : 0)
+-            }
++            .iridiumLaunchTransition(from: source, motion: motion, scale: true)
+             .accessibilityIdentifier("playerLaunchCover")
+     }
+ 
+--- a/iridium/apps/ios/Iridium/Views/RuntimePlayerView.swift
++++ b/iridium/apps/ios/Iridium/Views/RuntimePlayerView.swift
+@@ -211,7 +211,7 @@
+                                 .frame(width: 250, alignment: .leading)
+                                 .padding(16)
+                                 }
+-                                .scrollBounceBehavior(.basedOnSize)
++                                .iridiumScrollBounceBasedOnSize()
+                                 .frame(width: 282, height: min(390, max(100, safeGeometry.size.height - safeGeometry.safeAreaInsets.top - safeGeometry.safeAreaInsets.bottom - 80)))
+                                 .modifier(PlayerGlassPanel())
+                                 .accessibilityIdentifier("playerMenuPanel")
+@@ -656,7 +656,7 @@
+         addSubview(imageView)
+         #if MADEIRA_RUNTIME
+         if MadeiraRuntimeAdapter.enabled {
+-            if UIDevice.current.userInterfaceIdiom == .phone {
++            if #available(iOS 17.0, *), UIDevice.current.userInterfaceIdiom == .phone {
+                 // Scope the pointer interaction's tablet traits to the render view only.
+                 traitOverrides.userInterfaceIdiom = .pad
+             }
+--- a/iridium/apps/ios/Iridium/Views/IOS16Compatibility.swift
++++ b/iridium/apps/ios/Iridium/Views/IOS16Compatibility.swift
+@@ -43,6 +43,30 @@
+ enum IridiumKeyResult { case handled, ignored }
+ 
+ extension View {
++    @ViewBuilder func iridiumScrollBounceBasedOnSize() -> some View {
++        if #available(iOS 16.4, *) { scrollBounceBehavior(.basedOnSize) }
++        else { self }
++    }
++
++    // iOS 16 shows artwork at its final layout; iOS 17+ retains the transition.
++    @ViewBuilder func iridiumLaunchTransition(from source: CGRect?, motion: Bool,
++                                              scale: Bool = false) -> some View {
++        if #available(iOS 17.0, *) {
++            visualEffect { content, geometry in
++                let target = geometry.frame(in: .named("launchWindow"))
++                let start = source ?? target
++                return content
++                    .scaleEffect(x: motion && scale ? start.width / max(1, target.width) : 1,
++                                 y: motion && scale ? start.height / max(1, target.height) : 1,
++                                 anchor: .topLeading)
++                    .offset(x: motion ? start.minX - target.minX : 0,
++                            y: motion ? start.minY - target.minY : 0)
++            }
++        } else {
++            self
++        }
++    }
++
+     // iOS 16 retains native UIKit keyboard navigation. Custom SwiftUI key
+     // interception is enabled only on OS versions that actually support it.
+     @ViewBuilder func iridiumKeyPress(_ key: KeyEquivalent, action: @escaping () -> IridiumKeyResult) -> some View {
