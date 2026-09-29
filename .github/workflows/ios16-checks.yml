@@ -33,11 +33,13 @@ jobs:
           test "$(git rev-parse HEAD)" = c5e759da30fd2547786ba7ea68657c611f6562c5
           git apply --check --whitespace=error-all ../port/patches/ios16-checkpoint.patch
           git apply ../port/patches/ios16-checkpoint.patch
+          git apply --check --whitespace=error-all ../port/patches/ios16-compiler-fixes.patch
+          git apply ../port/patches/ios16-compiler-fixes.patch
           git diff --check
           mkdir -p .build/ios16-diagnostics .build/ios16-native-diagnostics
           git rev-parse HEAD > .build/ios16-diagnostics/source.log
           git -C ../port rev-parse HEAD >> .build/ios16-diagnostics/source.log
-          shasum -a 256 ../port/patches/ios16-checkpoint.patch >> .build/ios16-diagnostics/source.log
+          shasum -a 256 ../port/patches/*.patch >> .build/ios16-diagnostics/source.log
           cp .build/ios16-diagnostics/source.log .build/ios16-native-diagnostics/source.log
       - name: Check repository standards
         working-directory: upstream

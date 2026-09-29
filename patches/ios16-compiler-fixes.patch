@@ -1,0 +1,106 @@
+--- a/testrepos/Madeira/research/dxmt/src/winemetal/unix/winemetal_unix.c
++++ b/testrepos/Madeira/research/dxmt/src/winemetal/unix/winemetal_unix.c
+@@ -207,7 +207,16 @@
+     params->ret = (wmtr_call(RM_OP_COPY_ALL_DEVICES, 0, 0, &r, sizeof r, 0) == RM_OK) ? r.handle : 0;
+     return STATUS_SUCCESS;
+   }
+-  params->ret = (obj_handle_t)MTLCopyAllDevices();
++  if (@available(iOS 18.0, *)) {
++    params->ret = (obj_handle_t)MTLCopyAllDevices();
++  } else {
++    /* iOS 16/17 exposes one default GPU. Match Copy ownership under MRC. */
++    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++    NSArray *devices = device ? [[NSArray alloc] initWithObjects:device, nil]
++                              : [[NSArray alloc] init];
++    [device release];
++    params->ret = (obj_handle_t)devices;
++  }
+   return STATUS_SUCCESS;
+ }
+ 
+@@ -738,7 +747,7 @@
+   @autoreleasepool {
+     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+     if (dev) {
+-      if ([dev respondsToSelector:@selector(supportsBCTextureCompression)])
++      if (@available(iOS 16.4, macOS 11.0, *))
+         supported = [dev supportsBCTextureCompression];
+       [dev release];
+     }
+@@ -2736,7 +2745,10 @@
+     params->ret = (wmtr_call(RM_OP_SUPPORTS_BC, &a, sizeof a, &r, sizeof r, 0) == RM_OK) ? r.value : 0;
+     return STATUS_SUCCESS;
+   }
+-  params->ret = [(id<MTLDevice>)params->handle supportsBCTextureCompression];
++  if (@available(iOS 16.4, macOS 11.0, *))
++    params->ret = [(id<MTLDevice>)params->handle supportsBCTextureCompression];
++  else
++    params->ret = 0; /* Use the existing BC software decode path. */
+   return STATUS_SUCCESS;
+ }
+ 
+@@ -4845,7 +4857,13 @@
+     {
+       MTLLinkedFunctions *lf = [MTLLinkedFunctions linkedFunctions];
+       lf.functions = @[ fsi ];
+-      d.objectLinkedFunctions = lf;
++      if (@available(iOS 17.0, macOS 14.0, *)) {
++        d.objectLinkedFunctions = lf;
++      } else {
++        /* Returning the initialized null PSO reports failure to the caller. */
++        fprintf(stderr, "[winemetal] geometry pipeline requires iOS 17 or macOS 14 object linking\n");
++        return STATUS_SUCCESS;
++      }
+     }
+     e = nil;
+     params->ret_pso = (obj_handle_t)[(id<MTLDevice>)params->device newRenderPipelineStateWithMeshDescriptor:d
+--- a/ci/check-ios16-compile.sh
++++ b/ci/check-ios16-compile.sh
+@@ -12,6 +12,14 @@
+ if int(sys.argv[1].split('.')[0]) < 26:
+     raise SystemExit('Select Xcode with iOS SDK 26 or newer; the upstream guarded glass UI needs it.')
+ PY
++# The source checkout excludes the generated runtime bundle. SwiftPM still
++# requires its resource directory for this static compile-only target.
++# This marker is not a runtime payload and must never be packaged as one.
++resource="iridium/packages/runtime/Sources/IridiumRuntime/Resources/BundledRuntime"
++if [ ! -d "$resource" ]; then
++  mkdir -p "$resource"
++  printf '%s\n' 'Compile-only resource marker; no runtime included.' > "$resource/IOS16_COMPILE_ONLY.txt"
++fi
+ xcodegen generate --spec iridium/apps/ios/ios16-compile.yml
+ result=".build/ios16-diagnostics/compile-$(date +%Y%m%d-%H%M%S).xcresult"
+ xcodebuild -project iridium/apps/ios/IridiumIOS16Compile.xcodeproj \
+--- a/ci/check-ios16-native.sh
++++ b/ci/check-ios16-native.sh
+@@ -35,6 +35,7 @@
+     xcrun nm -u "$OUT/objects/$name.o" > "$OUT/$name.imports.log"
+   else
+     printf '%s\tFAIL\n' "$name" >> "$OUT/summary.tsv"
++    cat "$OUT/$name.log"
+     failures=$((failures + 1))
+   fi
+ }
+@@ -69,6 +70,7 @@
+     printf '%s\tPASS\n' "$name" >> "$OUT/summary.tsv"
+   else
+     printf '%s\tFAIL\n' "$name" >> "$OUT/summary.tsv"
++    cat "$OUT/$name.log"
+     failures=$((failures + 1))
+   fi
+ done
+--- a/CHANGES-FROM-UPSTREAM.md
++++ b/CHANGES-FROM-UPSTREAM.md
+@@ -180,3 +180,12 @@
+ Checkpoint 2 adds independent iOS 16 native-source and Metal 3.0 helper-shader
+ compiler probes, preserving per-unit diagnostics after failures. No production
+ runtime binaries, shader versions, or third-party runtime source are modified.
++
++The first Apple compiler run exposed newer API calls in the DXMT Unix bridge.
++The follow-up patch adds retained default-device enumeration before iOS 18,
++guards BC capability queries before iOS 16.4 (retaining software decoding), and
++refuses local geometry pipelines requiring object linking before iOS 17/macOS 14.
++These DXMT changes carry GPL-3.0-or-later with the Madeira Converter Exception;
++all existing upstream notices remain unchanged. The compile-only Swift probe
++creates a resource marker when the generated runtime directory is absent; it
++does not supply a runnable runtime. Native probe failures now print their logs.
