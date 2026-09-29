@@ -225,3 +225,20 @@
      // iOS 16 retains native UIKit keyboard navigation. Custom SwiftUI key
      // interception is enabled only on OS versions that actually support it.
      @ViewBuilder func iridiumKeyPress(_ key: KeyEquivalent, action: @escaping () -> IridiumKeyResult) -> some View {
+--- a/ci/test_launch_presentation.py
++++ b/ci/test_launch_presentation.py
+@@ -162,7 +162,13 @@
+         self.assertIn("LibraryBackdropScrim()", shelf)
+         self.assertIn("source: sourceTitle", art)
+         self.assertIn("source: sourceCover", art)
+-        self.assertIn('geometry.frame(in: .named("launchWindow"))', art)
++        compatibility = (VIEWS / "IOS16Compatibility.swift").read_text()
++        self.assertIn('.iridiumLaunchTransition(from: source, motion: motion)', art)
++        self.assertIn('.iridiumLaunchTransition(from: source, motion: motion, scale: true)', art)
++        helper = compatibility.split('@ViewBuilder func iridiumLaunchTransition', 1)[1].split('// iOS 16 retains', 1)[0]
++        self.assertIn('if #available(iOS 17.0, *)', helper)
++        self.assertIn('geometry.frame(in: .named("launchWindow"))', helper)
++        self.assertIn('} else {\n            self\n', helper)
+         self.assertLess(art.index("movingTitle(landscape: false"), art.index("movingCover(cover, width:", art.index("movingTitle(landscape: false")))
+         self.assertIn(".snappy(duration: RuntimeLaunchMotion.artworkMoveDuration, extraBounce: 0)", transition)
+         self.assertLess(transition.index("chrome?.alpha = 0"), transition.index("self.motionState.settle(animated: !context.transitionWasCancelled)"))
