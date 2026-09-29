@@ -1,0 +1,998 @@
+--- /dev/null
++++ b/.github/workflows/ios16-compile-check.yml
+@@ -0,0 +1,64 @@
++name: iOS 16 source compile check
++"on":
++  workflow_dispatch:
++    inputs:
++      runner:
++        description: macOS runner with Xcode 26 or newer (override for a custom runner)
++        type: string
++        default: macos-26
++        required: true
++permissions:
++  contents: read
++jobs:
++  native:
++    runs-on: ${{ inputs.runner }}
++    timeout-minutes: 30
++    steps:
++      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
++        with:
++          persist-credentials: false
++          submodules: false
++      - name: Ensure Metal compiler is available
++        run: |
++          mkdir -p .build/ios16-native-diagnostics
++          if ! xcrun --sdk iphoneos metal --version > .build/ios16-native-diagnostics/metal-toolchain.log 2>&1; then
++            xcodebuild -downloadComponent MetalToolchain 2>&1 | tee -a .build/ios16-native-diagnostics/metal-toolchain.log
++          fi
++      - name: Check native iOS 16 APIs and Metal 3.0 helper shaders
++        run: bash ci/check-ios16-native.sh
++      - name: Retain native diagnostics
++        if: always()
++        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
++        with:
++          name: Iridium-iOS16-native-diagnostics
++          path: |
++            .build/ios16-native-diagnostics/*.log
++            .build/ios16-native-diagnostics/*.tsv
++          if-no-files-found: warn
++          retention-days: 7
++  compile:
++    runs-on: ${{ inputs.runner }}
++    timeout-minutes: 45
++    steps:
++      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
++        with:
++          persist-credentials: false
++          submodules: false
++      - name: Check source
++        run: |
++          python3 check-public-source.py
++          python3 ci/check-standards.py
++      - name: Install project generator
++        run: brew install xcodegen
++      - name: Compile iOS 16 Swift and adapter sources (no runtime link)
++        run: bash ci/check-ios16-compile.sh
++      - name: Retain compiler diagnostics
++        if: always()
++        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
++        with:
++          name: Iridium-iOS16-compiler-diagnostics
++          path: |
++            .build/ios16-diagnostics/*.log
++            .build/ios16-diagnostics/*.xcresult
++          if-no-files-found: warn
++          retention-days: 7
+--- a/CHANGES-FROM-UPSTREAM.md
++++ b/CHANGES-FROM-UPSTREAM.md
+@@ -165,3 +165,18 @@
+ textual interface before attempting the app build.
+ 
+ - Cerbero restores bundled Cargo dependencies and rebuilds their source settings from Cargo.lock for offline builds. The patch is retained in `ci/patches/cerbero-cargo-source-cache.patch`; Cargo still checks the locked dependency graph and vendored checksums.
++
++
++## Experimental iOS 16 source checkpoint (2026-09-28)
++
++The Swift package minimum declarations are lowered to iOS 16 for a separate
++compile-only target. The production app and native runtime minimums remain
++unchanged pending graphics/JIT work. Iridium UI changes add an iOS 16/17 shelf,
++older callback and navigation forms, fallback empty states and symbol buttons,
++and guarded newer focus/keyboard APIs. iOS 18 retains the existing carousel.
++The new manual workflow checks source compilation, not runtime linking or
++compatibility. See `docs/ios16-port.md`. No third-party runtime code is changed.
++
++Checkpoint 2 adds independent iOS 16 native-source and Metal 3.0 helper-shader
++compiler probes, preserving per-unit diagnostics after failures. No production
++runtime binaries, shader versions, or third-party runtime source are modified.
+--- /dev/null
++++ b/ci/check-ios16-compile.sh
+@@ -0,0 +1,24 @@
++#!/bin/bash
++# Availability/type-check checkpoint only. Does not build an installable app.
++set -euo pipefail
++ROOT="$(cd "$(dirname "$0")/.." && pwd)"
++cd "$ROOT"
++mkdir -p .build/ios16-diagnostics
++test "$(uname -s)" = Darwin || { echo 'This check requires macOS with Xcode.' >&2; exit 1; }
++xcodebuild -version | tee .build/ios16-diagnostics/toolchain.log
++xcrun --sdk iphoneos --show-sdk-version | tee -a .build/ios16-diagnostics/toolchain.log
++python3 - "$(xcrun --sdk iphoneos --show-sdk-version)" <<'PY'
++import sys
++if int(sys.argv[1].split('.')[0]) < 26:
++    raise SystemExit('Select Xcode with iOS SDK 26 or newer; the upstream guarded glass UI needs it.')
++PY
++xcodegen generate --spec iridium/apps/ios/ios16-compile.yml
++result=".build/ios16-diagnostics/compile-$(date +%Y%m%d-%H%M%S).xcresult"
++xcodebuild -project iridium/apps/ios/IridiumIOS16Compile.xcodeproj \
++  -scheme IridiumIOS16Compile -configuration Debug \
++  -destination 'generic/platform=iOS' -derivedDataPath .build/ios16-compile \
++  -resultBundlePath "$result" IPHONEOS_DEPLOYMENT_TARGET=16.0 \
++  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
++  CODE_SIGN_IDENTITY= DEVELOPMENT_TEAM= build \
++  2>&1 | tee .build/ios16-diagnostics/compile.log
++echo 'Source compilation passed. Runtime linking, IPA installation, JIT and rendering are NOT tested.'
+--- /dev/null
++++ b/ci/check-ios16-native.sh
+@@ -0,0 +1,77 @@
++#!/bin/bash
++# Compile real native translation units at the proposed minimum, without linking
++# or substituting runtime functions. Attempt every unit to retain all diagnostics.
++set -euo pipefail
++ROOT="$(cd "$(dirname "$0")/.." && pwd)"
++cd "$ROOT"
++OUT="$ROOT/.build/ios16-native-diagnostics"
++mkdir -p "$OUT/objects" "$OUT/metal"
++test "$(uname -s)" = Darwin || { echo 'Requires macOS and an iPhoneOS SDK.' >&2; exit 1; }
++SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
++APP="$ROOT/testrepos/Madeira/app/Madeira"
++DXMT="$ROOT/testrepos/Madeira/research/dxmt"
++SUPPORT="$ROOT/iridium/apps/ios/MadeiraSupport"
++common=(-target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -fblocks
++        -Werror=unguarded-availability -Werror=unguarded-availability-new)
++failures=0
++printf 'unit\tresult\n' > "$OUT/summary.tsv"
++{
++  xcodebuild -version
++  xcrun --sdk iphoneos --show-sdk-version
++  echo 'Requested device minimum: iOS 16.0; native availability warnings are errors.'
++  echo 'This does not compile all FEX/Wine/LLVM/media dependencies or link an app.'
++} > "$OUT/toolchain.log"
++
++compile() {
++  local name="$1" source="$2" language="$3"
++  shift 3
++  # Never retain a stale object after a failed incremental probe.
++  rm -f "$OUT/objects/$name.o"
++  echo "Checking $name"
++  if xcrun --sdk iphoneos clang "${common[@]}" -x "$language" "$@" \
++       -c "$source" -o "$OUT/objects/$name.o" > "$OUT/$name.log" 2>&1; then
++    printf '%s\tPASS\n' "$name" >> "$OUT/summary.tsv"
++    xcrun otool -l "$OUT/objects/$name.o" > "$OUT/$name.load-commands.log"
++    xcrun nm -u "$OUT/objects/$name.o" > "$OUT/$name.imports.log"
++  else
++    printf '%s\tFAIL\n' "$name" >> "$OUT/summary.tsv"
++    failures=$((failures + 1))
++  fi
++}
++
++# Match the production MadeiraNative ARC and forced-environment-header settings.
++appflags=(-I "$APP" -I "$SUPPORT" -DWINE_IOS=1 -include "$SUPPORT/MadeiraSteamEnv.h")
++for name in JITAllocator PrefixExtractor; do
++  compile "$name" "$APP/$name.c" c "${appflags[@]}"
++done
++for name in IOSDisplayShim WineServerBridge WineProcessBridge; do
++  compile "$name" "$APP/$name.m" objective-c -fobjc-arc "${appflags[@]}"
++done
++compile Winios "$APP/Winios/Winios.m" objective-c -fobjc-arc "${appflags[@]}"
++compile WiniosGamepad "$APP/Winios/WiniosGamepad.c" c "${appflags[@]}"
++for name in NativePool MadeiraGuestControl MadeiraSteamEnv; do
++  compile "$name" "$SUPPORT/$name.c" c "${appflags[@]}"
++done
++
++# The upstream DXMT Unix bridge uses manual reference counting, not ARC.
++dxmtflags=(-I "$DXMT/include" -I "$DXMT/libs" -I "$DXMT/src/winemetal" -I "$DXMT/src/airconv")
++compile winemetal_unix "$DXMT/src/winemetal/unix/winemetal_unix.c" objective-c "${dxmtflags[@]}"
++compile winemetal_cache "$DXMT/src/winemetal/unix/cache.c" objective-c "${dxmtflags[@]}"
++
++# Test original helper source against Metal 3.0. Do not relabel existing AIR,
++# change production shaders, or mistake helper success for a DXBC backend port.
++for name in air_msad air_samplepos air_tessellation; do
++  rm -f "$OUT/metal/$name.air"
++  echo "Checking Metal 3.0: $name"
++  if xcrun --sdk iphoneos metal -std=metal3.0 --target=air64-apple-ios16.0 \
++       -c "$DXMT/src/airconv/shaders/$name.metal" -o "$OUT/metal/$name.air" \
++       > "$OUT/$name.log" 2>&1; then
++    printf '%s\tPASS\n' "$name" >> "$OUT/summary.tsv"
++  else
++    printf '%s\tFAIL\n' "$name" >> "$OUT/summary.tsv"
++    failures=$((failures + 1))
++  fi
++done
++cat "$OUT/summary.tsv"
++echo "$failures native/shader checks failed. No executable or IPA was produced."
++test "$failures" -eq 0
+--- /dev/null
++++ b/ci/test_ios16_native_probe.py
+@@ -0,0 +1,83 @@
++"""Test probe orchestration with a fake toolchain, never native compatibility."""
++import os
++from pathlib import Path
++import shutil
++import subprocess
++import sys
++import tempfile
++import unittest
++
++
++class NativeProbeTests(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.root = Path(self.temp.name)
++        (self.root / 'ci').mkdir()
++        shutil.copyfile(Path(__file__).with_name('check-ios16-native.sh'),
++                        self.root / 'ci/check-ios16-native.sh')
++        self.bin = self.root / 'bin'
++        self.bin.mkdir()
++        for name, body in {
++            'uname': '#!/bin/sh\necho Darwin\n',
++            'xcodebuild': '#!/bin/sh\necho Fake-toolchain-for-unit-tests\n',
++            'xcrun': f'#!{sys.executable}\n' + '''import os, pathlib, sys
++args = sys.argv[1:]
++if '--show-sdk-path' in args:
++    print('/fake-sdk')
++elif '--show-sdk-version' in args:
++    print('26.0')
++elif '-c' in args:
++    output = pathlib.Path(args[args.index('-o') + 1])
++    expected = 'air64-apple-ios16.0' if 'metal' in args else 'arm64-apple-ios16.0'
++    if not any(expected in arg for arg in args):
++        sys.exit(3)
++    if 'clang' in args and '-Werror=unguarded-availability-new' not in args:
++        sys.exit(4)
++    if 'metal' in args and '-std=metal3.0' not in args:
++        sys.exit(5)
++    if output.stem == os.environ.get('PROBE_FAIL_UNIT'):
++        sys.exit(2)
++    output.parent.mkdir(parents=True, exist_ok=True)
++    output.write_text('FAKE UNIT TEST OBJECT - NOT MACHINE CODE')
++else:
++    print('Fake inspection output')
++''',
++        }.items():
++            path = self.bin / name
++            path.write_text(body)
++            path.chmod(0o755)
++        self.out = self.root / '.build/ios16-native-diagnostics'
++
++    def run_probe(self, fail=''):
++        return subprocess.run(
++            ['bash', str(self.root / 'ci/check-ios16-native.sh')],
++            env={**os.environ, 'PATH': str(self.bin) + os.pathsep + os.environ['PATH'],
++                 'PROBE_FAIL_UNIT': fail},
++            capture_output=True, text=True,
++        )
++
++    def test_compiles_all_units_with_requested_target(self):
++        result = self.run_probe()
++        self.assertEqual(result.returncode, 0, result.stderr)
++        rows = (self.out / 'summary.tsv').read_text().splitlines()[1:]
++        self.assertEqual(len(rows), 15)
++        self.assertTrue(all(row.endswith('\tPASS') for row in rows))
++
++    def test_failure_keeps_later_diagnostics_and_returns_failure(self):
++        result = self.run_probe('JITAllocator')
++        self.assertNotEqual(result.returncode, 0)
++        summary = (self.out / 'summary.tsv').read_text()
++        self.assertIn('JITAllocator\tFAIL', summary)
++        self.assertIn('air_tessellation\tPASS', summary)
++        self.assertTrue((self.out / 'JITAllocator.log').is_file())
++
++    def test_failed_rebuild_does_not_reuse_old_object(self):
++        self.assertEqual(self.run_probe().returncode, 0)
++        self.assertTrue((self.out / 'objects/JITAllocator.o').is_file())
++        self.assertNotEqual(self.run_probe('JITAllocator').returncode, 0)
++        self.assertFalse((self.out / 'objects/JITAllocator.o').exists())
++
++
++if __name__ == '__main__':
++    unittest.main()
+--- /dev/null
++++ b/docs/ios16-port.md
+@@ -0,0 +1,92 @@
++# Experimental iOS 16 port: source checkpoint 2
++
++This is an unfinished source port, not an iOS 16-compatible release or IPA.
++Target device for future testing: iPhone 13 Pro Max, iOS 16.0.
++
++## Implemented in this checkpoint
++
++- iOS 16 Swift package minimum declarations for the diagnostic compiler target.
++- Separate native-scroll library shelf for iOS 16/17, including search, favorites,
++  import, settings, selection, Play, game options, and controller selection.
++- Original iOS 18 carousel retained behind an availability boundary.
++- iOS 16 callback/navigation overloads, empty states, labeled buttons, animation
++  fallback, and a guard around the iOS 16.4 hosting-controller safe-area API.
++- Newer SwiftUI keyboard interception/focus effects guarded at iOS 17. On iOS 16
++  native UIKit keyboard behavior remains; custom SwiftUI arrow/Escape handlers
++  are not backported yet. Touch and controller paths still require device QA.
++- Manual compiler workflow with diagnostics retained even when compilation fails.
++- An independent native compiler job for 12 real translation units (JIT allocator,
++  Wine/display/input bridges, native pool, and DXMT's Unix Metal bridge/cache).
++- Separate compilation of the three original AIR helper shader sources under
++  Metal 3.0 / iOS 16.0. No production shader metadata is rewritten.
++
++## Run the compiler checkpoint
++
++In a fork containing the modified files, select Actions → iOS 16 source compile
++check → Run workflow. The default runner is `macos-26`; the input can select a
++custom runner. GitHub must allow Actions in the fork. Run it from the branch
++containing the patch; a newly added manual workflow may need to be on the fork's
++default branch before GitHub shows its Run workflow button.
++
++On a Mac with Xcode 26+ and XcodeGen, from the repository root:
++
++```sh
++bash ci/check-ios16-compile.sh
++```
++
++The target compiles the app Swift sources and the Madeira Swift adapters with
++an iOS 16.0 minimum. A header-only MadeiraNative module exposes the existing C
++declarations; it supplies no emulator implementation. Static archives deliberately
++do not establish runtime symbol resolution. No executable, IPA, runtime helper,
++code signing, or release is produced. The existing production workflow is not
++converted into an iOS 16 build by this checkpoint.
++
++The second job runs `bash ci/check-ios16-native.sh`. It compiles the original
++native sources to arm64 objects with iOS 16.0 as the minimum and makes unguarded
++availability warnings fatal. Each unit gets its own log; one compiler failure
++continues to the remaining units before the job fails. Successful objects have
++load-command and unresolved-import listings retained for inspection. It does not
++compile all FEX/Wine/LLVM/media dependencies and does not resolve runtime imports.
++
++Download both `Iridium-iOS16-compiler-diagnostics` and
++`Iridium-iOS16-native-diagnostics` after the run. A failure is useful:
++its compiler errors identify the next concrete changes. A successful run proves
++only source compilation, not that native dependencies link or that games run.
++
++## Remaining runtime work
++
++1. **DXMT shader output:** `testrepos/Madeira/research/dxmt/src/airconv/airconv_public.h`
++   exposes Metal 310/320, with no 300 mode. `dxbc_converter.cpp` writes Metal 3.1/3.2
++   AIR metadata; `metallib_writer.cpp` contains 3.1 library metadata.
++   `ci/prepare-native-runtime.sh` builds helper shaders with `-std=metal3.1`.
++   A genuine Metal 3.0 backend requires reviewing generated instructions, shader
++   features, library headers, and Metal host API availability. Relabeling metadata
++   alone would not establish compatibility. This backend is not modified here.
++2. **DirectX 12:** Apple's documented converter output requirements name iOS 17+;
++   earlier-OS output has feature limitations. Inspect the exact pinned converter
++   binary and its emitted shader requirements before considering an older OS.
++   Do not promise DirectX 12 support as part of the first iOS 16 test.
++3. **Native dependencies:** app targets, native LLVM/FEX, DXMT, media, ANGLE, and
++   Wine build scripts have iOS 17/18 minimums. Rebuild every linked dependency for
++   iOS 16, fix unavailable APIs, and audit Mach-O load commands and imported symbols.
++   A lower app Info.plist alone does not solve this.
++4. **JIT:** BuiltinJIT explicitly requires iOS 18; its source build also has a
++   newer minimum. For iOS 16, exclude that helper from the eventual package and
++   validate an appropriate existing JIT path and real executable-memory allocation
++   on the device. A jailbreak or entitlement alone does not prove allocation works.
++5. **Final link and device test:** rebuild the real MadeiraNative implementation,
++   package an unsigned app only after checks pass, then test startup, JIT, a small
++   graphics workload, input, audio, saves, and shutdown on iOS 16.0.
++
++## Evidence and limitations
++
++Local source/privacy checks and Python regression checks are separate from
++Apple SDK compilation. The supplied checkpoint was prepared on Linux without
++Xcode, an attached iPhone, or a dispatched GitHub Actions run. No claim is made
++that the Swift changes already compile, install, or execute on iOS 16.
++The handoff accompanying the patch records the exact local test results.
++
++References:
++- Apple Metal Shader Converter: https://developer.apple.com/metal/shader-converter/
++- Apple Metal language specification: https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf
++- GitHub runner labels: https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+--- a/iridium-runtime-sdk/Package.swift
++++ b/iridium-runtime-sdk/Package.swift
+@@ -124,7 +124,7 @@
+ let package = Package(
+     name: "iridium-runtime-sdk",
+     platforms: [
+-        .iOS(.v18),
++        .iOS(.v16),
+         .macOS(.v15),
+     ],
+     products: [
+--- a/iridium/Package.swift
++++ b/iridium/Package.swift
+@@ -44,7 +44,7 @@
+ let package = Package(
+     name: "Iridium",
+     platforms: [
+-        .iOS(.v18),
++        .iOS(.v16),
+         .macOS(.v15),
+     ],
+     products: [
+--- /dev/null
++++ b/iridium/apps/ios/IOS16Compile/ModuleAnchor.c
+@@ -0,0 +1,3 @@
++// Compile-only header module. Intentionally supplies no emulator functions.
++// The archive is never an app and must not be used as a runtime dependency.
++const int iridium_ios16_compile_only_header_module = 1;
+--- a/iridium/apps/ios/Iridium/Input/InputSettingsViews.swift
++++ b/iridium/apps/ios/Iridium/Input/InputSettingsViews.swift
+@@ -124,7 +124,7 @@
+         .navigationTitle("Input Settings")
+         .navigationBarTitleDisplayMode(.inline)
+         .iridiumListChrome()
+-        .onChange(of: touchControlsEnabled) { _, enabled in
++        .onChange(of: touchControlsEnabled) { enabled in
+             TouchControllerLayoutStore.setEnabled(enabled, for: game.id)
+         }
+         .onReceive(NotificationCenter.default.publisher(for: .GCControllerDidConnect)) { _ in refreshDevices() }
+--- a/iridium/apps/ios/Iridium/Input/TouchControllerLayoutEditorView.swift
++++ b/iridium/apps/ios/Iridium/Input/TouchControllerLayoutEditorView.swift
+@@ -71,7 +71,7 @@
+             if let selectedIndex {
+                 inspector(index: selectedIndex)
+             } else {
+-                ContentUnavailableView(
++                IridiumEmptyState(
+                     "Select a Control",
+                     systemImage: "hand.tap",
+                     description: Text("Choose a control above, or add a new one.")
+@@ -82,10 +82,10 @@
+         .navigationTitle("On-Screen Controller")
+         .navigationBarTitleDisplayMode(.inline)
+         .toolbar {
+-            ToolbarItemGroup(placement: .topBarTrailing) {
++            ToolbarItemGroup(placement: .navigationBarTrailing) {
+                 Menu {
+                     ForEach(TouchControllerMapping.allCases) { mapping in
+-                        Button(mapping.displayName, systemImage: mapping.systemImage) {
++                        IridiumSymbolButton(mapping.displayName, systemImage: mapping.systemImage) {
+                             add(mapping)
+                         }
+                     }
+@@ -93,7 +93,7 @@
+                     Label("Add Control", systemImage: "plus")
+                 }
+ 
+-                Button("Reset", systemImage: "arrow.counterclockwise") {
++                IridiumSymbolButton("Reset", systemImage: "arrow.counterclockwise") {
+                     confirmingReset = true
+                 }
+ 
+--- a/iridium/apps/ios/Iridium/IridiumApp.swift
++++ b/iridium/apps/ios/Iridium/IridiumApp.swift
+@@ -50,7 +50,7 @@
+ 
+                 viewModel = await AppViewModel.make()
+             }
+-            .onChange(of: scenePhase) { _, newPhase in
++            .onChange(of: scenePhase) { newPhase in
+                 guard let viewModel else {
+                     return
+                 }
+--- a/iridium/apps/ios/Iridium/LibraryController.swift
++++ b/iridium/apps/ios/Iridium/LibraryController.swift
+@@ -82,7 +82,7 @@
+     func makeUIViewController(context: Context) -> Host {
+         let host = Host()
+         let child = Hosting(rootView: content())
+-        if fullScreen { child.safeAreaRegions = [.keyboard] }
++        if #available(iOS 16.4, *), fullScreen { child.safeAreaRegions = [.keyboard] }
+         host.addChild(child)
+         host.view.backgroundColor = .clear
+         child.view.backgroundColor = .clear
+@@ -193,10 +193,10 @@
+         return content
+             // Keyboard and controller use the same row highlight; text editing keeps native focus.
+             .focused($keyboardFocused)
+-            .onChange(of: keyboardFocused) { _, focused in
++            .onChange(of: keyboardFocused) { focused in
+                 if focused { focus.selected = id }
+             }
+-            .focusEffectDisabled(focus.endEditing == nil)
++            .iridiumFocusEffectDisabled(focus.endEditing == nil)
+             .padding(.vertical, 3)
+             .background {
+                 RoundedRectangle(cornerRadius: 10).fill(.white.opacity((focus.visible && focus.selected == id) || keyboardFocused ? 0.16 : 0))
+@@ -255,12 +255,12 @@
+                     }
+                 }
+                 .onDisappear { controller?.popMenu(id: id) }
+-                .onKeyPress(.upArrow) { guard focus.endEditing == nil else { return .ignored }; focus.receive(.up); return .handled }
+-                .onKeyPress(.downArrow) { guard focus.endEditing == nil else { return .ignored }; focus.receive(.down); return .handled }
+-                .onKeyPress(.leftArrow) { guard focus.endEditing == nil else { return .ignored }; focus.receive(.left); return .handled }
+-                .onKeyPress(.rightArrow) { guard focus.endEditing == nil else { return .ignored }; focus.receive(.right); return .handled }
+-                .onKeyPress(.return) { guard focus.endEditing == nil else { return .ignored }; focus.receive(.select); return .handled }
+-                .onKeyPress(.escape) { if focus.endEditing?() != true { if let onBack { onBack() } else { dismiss() } }; return .handled }
++                .iridiumKeyPress(.upArrow) { guard focus.endEditing == nil else { return .ignored }; focus.receive(.up); return .handled }
++                .iridiumKeyPress(.downArrow) { guard focus.endEditing == nil else { return .ignored }; focus.receive(.down); return .handled }
++                .iridiumKeyPress(.leftArrow) { guard focus.endEditing == nil else { return .ignored }; focus.receive(.left); return .handled }
++                .iridiumKeyPress(.rightArrow) { guard focus.endEditing == nil else { return .ignored }; focus.receive(.right); return .handled }
++                .iridiumKeyPress(.return) { guard focus.endEditing == nil else { return .ignored }; focus.receive(.select); return .handled }
++                .iridiumKeyPress(.escape) { if focus.endEditing?() != true { if let onBack { onBack() } else { dismiss() } }; return .handled }
+ 
+         .transformPreference(MenuItemsKey.self) { $0 = [] }
+ #if INTERFACE_PREVIEW
+@@ -337,7 +337,7 @@
+             else { TextField(title, text: $text) }
+         }.focused($editing)
+             .menuFocusable(action: { fieldFocus.wrappedValue = true })
+-            .onChange(of: editing) { _, editing in
++            .onChange(of: editing) { editing in
+                 if editing { focus?.endEditing = { fieldFocus.wrappedValue = false; return true } }
+                 else { focus?.endEditing = nil }
+             }
+--- a/iridium/apps/ios/Iridium/Views/ActivityView.swift
++++ b/iridium/apps/ios/Iridium/Views/ActivityView.swift
+@@ -10,7 +10,7 @@
+                 && viewModel.launchHistory.isEmpty
+                 && viewModel.verificationAudits.isEmpty
+             {
+-                ContentUnavailableView(
++                IridiumEmptyState(
+                     "No Activity Yet",
+                     systemImage: "clock.arrow.circlepath",
+                     description: Text("Imports, compatibility checks, repairs, and launches will appear here.")
+--- a/iridium/apps/ios/Iridium/Views/GameConfigurationViews.swift
++++ b/iridium/apps/ios/Iridium/Views/GameConfigurationViews.swift
+@@ -65,7 +65,7 @@
+                         .foregroundStyle(.secondary)
+                 }.listRowBackground(RoundedRectangle(cornerRadius: 16).fill(Color.white.opacity(0.06)).padding(.vertical, 2)).listRowSeparator(.hidden)
+             } else {
+-                ContentUnavailableView(
++                IridiumEmptyState(
+                     "Environment Missing",
+                     systemImage: "shippingbox.and.arrow.backward",
+                     description: Text("Run a compatibility check to recreate the environment assignment for this game.")
+--- a/iridium/apps/ios/Iridium/Views/GameDetailView.swift
++++ b/iridium/apps/ios/Iridium/Views/GameDetailView.swift
+@@ -79,7 +79,7 @@
+                         Image(systemName: "chevron.left").font(.title3.weight(.semibold))
+                             .frame(width: 32, height: 32)
+                     }
+-                    .libraryGlass().buttonBorderShape(.circle)
++                    .libraryGlass().buttonBorderShape(.capsule)
+                     .accessibilityLabel("Back")
+                     Spacer()
+                 }
+--- /dev/null
++++ b/iridium/apps/ios/Iridium/Views/IOS16Compatibility.swift
+@@ -0,0 +1,65 @@
++import SwiftUI
++
++/// Explicit compatibility views avoid shadowing Apple's newer API names.
++struct IridiumEmptyState: View {
++    let title: LocalizedStringKey
++    let systemImage: String
++    let description: Text?
++
++    init(_ title: LocalizedStringKey, systemImage: String, description: Text? = nil) {
++        self.title = title
++        self.systemImage = systemImage
++        self.description = description
++    }
++
++    var body: some View {
++        VStack(spacing: 12) {
++            Image(systemName: systemImage).font(.largeTitle).foregroundStyle(.secondary)
++            Text(title).font(.title2.bold())
++            description?.foregroundStyle(.secondary).multilineTextAlignment(.center)
++        }.padding(24).frame(maxWidth: .infinity, maxHeight: .infinity)
++            .accessibilityElement(children: .combine)
++    }
++}
++
++struct IridiumSymbolButton: View {
++    let title: String
++    let systemImage: String
++    let role: ButtonRole?
++    let action: () -> Void
++
++    init(_ title: String, systemImage: String, role: ButtonRole? = nil, action: @escaping () -> Void) {
++        self.title = title
++        self.systemImage = systemImage
++        self.role = role
++        self.action = action
++    }
++
++    var body: some View {
++        Button(role: role, action: action) { Label(title, systemImage: systemImage) }
++    }
++}
++
++enum IridiumKeyResult { case handled, ignored }
++
++extension View {
++    // iOS 16 retains native UIKit keyboard navigation. Custom SwiftUI key
++    // interception is enabled only on OS versions that actually support it.
++    @ViewBuilder func iridiumKeyPress(_ key: KeyEquivalent, action: @escaping () -> IridiumKeyResult) -> some View {
++        if #available(iOS 17.0, *) {
++            onKeyPress(key) { action() == .handled ? .handled : .ignored }
++        } else {
++            self
++        }
++    }
++
++    @ViewBuilder func iridiumFocusEffectDisabled(_ disabled: Bool) -> some View {
++        if #available(iOS 17.0, *) { focusEffectDisabled(disabled) }
++        else { self }
++    }
++
++    @ViewBuilder func iridiumFocusable(_ enabled: Bool) -> some View {
++        if #available(iOS 17.0, *) { focusable(enabled) }
++        else { self }
++    }
++}
+--- /dev/null
++++ b/iridium/apps/ios/Iridium/Views/LegacyLibraryShelf.swift
+@@ -0,0 +1,124 @@
++import SwiftUI
++import IridiumCore
++
++/// iOS 18 keeps the original interactive carousel. iOS 16/17 use native scrolling.
++struct LibraryShelf: View {
++    let games: [GameRecord]
++    @ObservedObject var artwork: LibraryArtwork
++    @ObservedObject var controller: LibraryController
++    let play: (GameRecord) -> Void
++    let disabled: (GameRecord) -> Bool
++    let launchTitle: (GameRecord) -> String
++    var launchDetail: (GameRecord) -> String? = { _ in nil }
++    let details: (GameRecord) -> Void
++    @Binding var search: String
++    @Binding var favorites: Bool
++    @Binding var selectedID: UUID?
++    var importGame: () -> Void = {}
++    var settings: () -> Void = {}
++    var acceptsControllerInput = true
++
++    var body: some View {
++        if #available(iOS 18.0, *) {
++            ModernLibraryShelf(games: games, artwork: artwork, controller: controller, play: play, disabled: disabled, launchTitle: launchTitle, launchDetail: launchDetail, details: details, search: $search, favorites: $favorites, selectedID: $selectedID, importGame: importGame, settings: settings, acceptsControllerInput: acceptsControllerInput)
++        } else {
++            LegacyLibraryShelf(games: games, artwork: artwork, controller: controller, play: play, disabled: disabled, launchTitle: launchTitle, launchDetail: launchDetail, details: details, search: $search, favorites: $favorites, selectedID: $selectedID, importGame: importGame, settings: settings, acceptsControllerInput: acceptsControllerInput)
++        }
++    }
++}
++
++private struct LegacyLibraryShelf: View {
++    @Environment(\.accessibilityReduceMotion) private var reduceMotion
++    let games: [GameRecord]
++    @ObservedObject var artwork: LibraryArtwork
++    @ObservedObject var controller: LibraryController
++    let play: (GameRecord) -> Void
++    let disabled: (GameRecord) -> Bool
++    let launchTitle: (GameRecord) -> String
++    var launchDetail: (GameRecord) -> String? = { _ in nil }
++    let details: (GameRecord) -> Void
++    @Binding var search: String
++    @Binding var favorites: Bool
++    @Binding var selectedID: UUID?
++    var importGame: () -> Void = {}
++    var settings: () -> Void = {}
++    var acceptsControllerInput = true
++
++    private var filtered: [GameRecord] {
++        games.filter { (!favorites || artwork.appearance($0.id).favorite)
++            && (search.isEmpty || artwork.title($0).localizedCaseInsensitiveContains(search)) }
++    }
++    private var selected: GameRecord? { filtered.first { $0.id == selectedID } ?? filtered.first }
++    var body: some View {
++        ScrollViewReader { proxy in
++            VStack(spacing: 16) {
++                HStack {
++                    Text("Iridium").font(.largeTitle.bold())
++                    Spacer()
++                    Button(action: importGame) { Image(systemName: "plus").frame(width: 44, height: 44) }.accessibilityLabel("Add Game")
++                    Button(action: settings) { Image(systemName: "gearshape").frame(width: 44, height: 44) }.accessibilityLabel("Settings")
++                }
++                TextField("Search games", text: $search)
++                    .textFieldStyle(.roundedBorder).textInputAutocapitalization(.never).autocorrectionDisabled()
++                Picker("Library filter", selection: $favorites) {
++                    Text("All Games").tag(false)
++                    Text("Favorites").tag(true)
++                }.pickerStyle(.segmented)
++                if filtered.isEmpty {
++                    IridiumEmptyState("No Games", systemImage: "gamecontroller",
++                        description: Text("Add a game or change your search and filter."))
++                } else {
++                    ScrollView(.horizontal) {
++                        LazyHStack(spacing: 18) {
++                            ForEach(filtered) { game in
++                                Button { selectedID = game.id } label: {
++                                    VStack {
++                                        ArtworkImage(image: artwork.displayImage(artwork.appearance(game.id).cover), title: "", fit: true)
++                                            .frame(width: 140, height: 190).clipShape(RoundedRectangle(cornerRadius: 12))
++                                        Text(artwork.title(game)).lineLimit(2).frame(width: 140)
++                                    }.padding(6).overlay {
++                                        RoundedRectangle(cornerRadius: 16).stroke(selected?.id == game.id ? Color.white : Color.clear, lineWidth: 2)
++                                    }
++                                }.buttonStyle(.plain).id(game.id)
++                                    .accessibilityLabel(artwork.title(game))
++                                    .accessibilityAddTraits(selected?.id == game.id ? [.isSelected] : [])
++                            }
++                        }.padding(4)
++                    }
++                    if let game = selected {
++                        HStack {
++                            Button(launchTitle(game)) { play(game) }.buttonStyle(.borderedProminent).disabled(disabled(game))
++                            Button("Game Options") { details(game) }.buttonStyle(.bordered)
++                        }
++                        if let detail = launchDetail(game) { Text(detail).font(.footnote).foregroundStyle(.secondary) }
++                    }
++                }
++            }.padding().iridiumPageSurface(artwork: artwork, gameID: selected?.id)
++                .onAppear {
++                    artwork.backdropGameID = selected?.id
++                    controller.libraryNavigationActive = acceptsControllerInput
++                }
++                .onDisappear { controller.libraryNavigationActive = false }
++                .onChange(of: acceptsControllerInput) { controller.libraryNavigationActive = $0 }
++                .onChange(of: selected?.id) { id in
++                    artwork.backdropGameID = id
++                    if let id { withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.16)) { proxy.scrollTo(id, anchor: .center) } }
++                }
++                .onReceive(controller.input) { input in
++                    guard acceptsControllerInput, !controller.nativeMenuActive else { return }
++                    switch input {
++                    case .left, .right:
++                        guard !filtered.isEmpty else { return }
++                        let index = filtered.firstIndex { $0.id == selected?.id } ?? 0
++                        selectedID = filtered[min(filtered.count - 1, max(0, index + (input == .left ? -1 : 1)))].id
++                    case .play, .select:
++                        if let game = selected, !disabled(game) { play(game) }
++                    case .options: if let game = selected { details(game) }
++                    case .previousTab: favorites = false
++                    case .nextTab: favorites = true
++                    default: break
++                    }
++                }
++        }
++    }
++}
+--- a/iridium/apps/ios/Iridium/Views/LibraryAppearanceEditor.swift
++++ b/iridium/apps/ios/Iridium/Views/LibraryAppearanceEditor.swift
+@@ -98,8 +98,8 @@
+                     try artwork.setImage(Data(contentsOf: url), id: game.id, background: background)
+                 }
+             }
+-            .onChange(of: files || photosPresented) { _, presented in controller?.nativeMenuActive = presented }
+-            .onChange(of: photo) { _, value in
++            .onChange(of: files || photosPresented) { presented in controller?.nativeMenuActive = presented }
++            .onChange(of: photo) { value in
+                 let target = background
+                 Task {
+                     do {
+--- a/iridium/apps/ios/Iridium/Views/LibraryShelf.swift
++++ b/iridium/apps/ios/Iridium/Views/LibraryShelf.swift
+@@ -1,7 +1,8 @@
+ import SwiftUI
+ import IridiumCore
+ 
+-struct LibraryShelf: View {
++@available(iOS 18.0, *)
++struct ModernLibraryShelf: View {
+     let games: [GameRecord]
+     @ObservedObject var artwork: LibraryArtwork
+     @ObservedObject var controller: LibraryController
+--- a/iridium/apps/ios/Iridium/Views/LibraryView.swift
++++ b/iridium/apps/ios/Iridium/Views/LibraryView.swift
+@@ -56,10 +56,15 @@
+                 if let result = viewModel.importScanResult { importReviewCard(result) }
+             }
+         }
+-        .navigationDestination(item: $detailGame) { game in
+-            GameDetailView(game: game, viewModel: viewModel, locate: {
+-                relocatingGame = game; requestGameImport()
+-            })
++        .navigationDestination(isPresented: Binding(
++            get: { detailGame != nil },
++            set: { if !$0 { detailGame = nil } }
++        )) {
++            if let game = detailGame {
++                GameDetailView(game: game, viewModel: viewModel, locate: {
++                    relocatingGame = game; requestGameImport()
++                })
++            }
+         }
+         .task(id: "\(viewModel.games.map(\.id))-\(artwork.connected)") { await artwork.prepare(viewModel.games) }
+         .alert("Artwork", isPresented: Binding(get: { artwork.error != nil }, set: { if !$0 { artwork.error = nil } })) {
+@@ -114,7 +119,7 @@
+             Text("LiveContainer settings are repaired. Fully close Iridium, then reopen it from LiveContainer so the updated launch settings take effect.")
+         }
+         .onAppear { refreshLiveContainerSetup() }
+-        .onChange(of: scenePhase) { _, phase in
++        .onChange(of: scenePhase) { phase in
+             if phase == .active { refreshLiveContainerSetup() }
+         }
+     }
+--- a/iridium/apps/ios/Iridium/Views/RuntimeLaunchArtworkView.swift
++++ b/iridium/apps/ios/Iridium/Views/RuntimeLaunchArtworkView.swift
+@@ -143,7 +143,7 @@
+ 
+     private var recoveryActions: some View {
+         Group {
+-            Button("View Logs", systemImage: "doc.text", action: viewLogs).libraryGlass(prominent: true)
++            IridiumSymbolButton("View Logs", systemImage: "doc.text", action: viewLogs).libraryGlass(prominent: true)
+             Button("Back to Library", action: close).libraryGlass()
+         }
+         .frame(minHeight: 44)
+--- a/iridium/apps/ios/Iridium/Views/RuntimeLaunchTransition.swift
++++ b/iridium/apps/ios/Iridium/Views/RuntimeLaunchTransition.swift
+@@ -72,7 +72,13 @@
+     func settle(animated: Bool) {
+         guard !settled else { return }
+         if animated {
+-            withAnimation(.snappy(duration: RuntimeLaunchMotion.artworkMoveDuration, extraBounce: 0)) {
++            let animation: Animation
++            if #available(iOS 17.0, *) {
++                animation = .snappy(duration: RuntimeLaunchMotion.artworkMoveDuration, extraBounce: 0)
++            } else {
++                animation = .easeInOut(duration: RuntimeLaunchMotion.artworkMoveDuration)
++            }
++            withAnimation(animation) {
+                 settled = true
+             }
+         } else {
+--- a/iridium/apps/ios/Iridium/Views/RuntimePlayerView.swift
++++ b/iridium/apps/ios/Iridium/Views/RuntimePlayerView.swift
+@@ -15,7 +15,7 @@
+         if #available(iOS 26.0, macOS 26.0, *) {
+             content.buttonStyle(.glass).buttonBorderShape(.circle)
+         } else {
+-            content.buttonStyle(.bordered).buttonBorderShape(.circle)
++            content.buttonStyle(.bordered).buttonBorderShape(.capsule)
+         }
+     }
+ }
+@@ -172,13 +172,13 @@
+                                 Button {
+                                     withOptionalAnimation { controlsVisible.toggle() }
+                                 } label: { Image(systemName: "ellipsis").frame(width: 44, height: 44) }
+-                                .modifier(PlayerGlassButton()).focusable(false).accessibilityLabel("Player Menu")
++                                .modifier(PlayerGlassButton()).iridiumFocusable(false).accessibilityLabel("Player Menu")
+                             }
+                             if controlsVisible {
+                                 ScrollView {
+                                 VStack(alignment: .leading, spacing: 8) {
+-                                    Button("Resume", systemImage: "play") { controlsVisible = false }.frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+-                                    Button("Input Settings", systemImage: "gamecontroller") {
++                                    IridiumSymbolButton("Resume", systemImage: "play") { controlsVisible = false }.frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
++                                    IridiumSymbolButton("Input Settings", systemImage: "gamecontroller") {
+                                         deviceKeyboardVisible = false
+                                         isShowingControls = true
+                                         controlsVisible = false
+@@ -195,15 +195,15 @@
+                                     }
+                                     .padding(.vertical, 4)
+                                     Toggle("Pin Performance HUD", isOn: $showPerformance).frame(minHeight: 44)
+-                                    Button("View Log", systemImage: "doc.text") { deviceKeyboardVisible = false; isShowingDiagnostics = true; controlsVisible = false }.frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
++                                    IridiumSymbolButton("View Log", systemImage: "doc.text") { deviceKeyboardVisible = false; isShowingDiagnostics = true; controlsVisible = false }.frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                                     if launchPresentation == .starting {
+-                                        Button("Cancel Launch", systemImage: "xmark", role: .destructive) {
++                                        IridiumSymbolButton("Cancel Launch", systemImage: "xmark", role: .destructive) {
+                                             deviceKeyboardVisible = false
+                                             controlsVisible = false
+                                             viewModel.dismissActiveRuntimePlayer()
+                                         }.frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                                     } else {
+-                                        Button("Close Game", systemImage: "xmark", role: .destructive) { deviceKeyboardVisible = false; isConfirmingClose = true }.frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
++                                        IridiumSymbolButton("Close Game", systemImage: "xmark", role: .destructive) { deviceKeyboardVisible = false; isConfirmingClose = true }.frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                                     }
+                                 }
+                                 .buttonStyle(.plain)
+@@ -340,23 +340,23 @@
+                 .onReceive(NotificationCenter.default.publisher(for: .GCMouseDidDisconnect)) { _ in
+                     showInputNotice(device: "Mouse", symbol: "computermouse.fill", connected: false)
+                 }
+-                .onChange(of: controlsVisible) { _, visible in
++                .onChange(of: controlsVisible) { visible in
+                     if visible { deviceKeyboardVisible = false }
+                     updatePointerCapture()
+                 }
+-                .onChange(of: deviceKeyboardVisible) { _, _ in updatePointerCapture() }
+-                .onChange(of: session.state) { _, _ in updatePointerCapture() }
+-                .onChange(of: launchPresentation) { _, phase in
++                .onChange(of: deviceKeyboardVisible) { _ in updatePointerCapture() }
++                .onChange(of: session.state) { _ in updatePointerCapture() }
++                .onChange(of: launchPresentation) { phase in
+                     updatePointerCapture()
+                 }
+-                .onChange(of: viewModel.closingMadeiraSession) { _, _ in updatePointerCapture() }
+-                .onChange(of: keyboardInputRejected) { _, _ in updatePointerCapture() }
++                .onChange(of: viewModel.closingMadeiraSession) { _ in updatePointerCapture() }
++                .onChange(of: keyboardInputRejected) { _ in updatePointerCapture() }
+                 .alert("Keyboard input not sent", isPresented: $keyboardInputRejected) {
+                     Button("OK", role: .cancel) {}
+                 } message: {
+                     Text("The device-keyboard bridge supports basic US-layout letters, numbers, and symbols. This insertion contained an unsupported character; nothing from that insertion was sent.")
+                 }
+-                .onKeyPress(.escape) {
++                .iridiumKeyPress(.escape) {
+                     guard controlsVisible || launchPresentation.showsArtwork else { return .ignored }
+                     controlsVisible.toggle()
+                     return .handled
+@@ -364,9 +364,9 @@
+                 .sheet(isPresented: $isShowingControls, onDismiss: finishInputSettingsDismissal) {
+                     inputSettingsSheet
+                 }
+-                .onChange(of: isShowingControls) { _, _ in updatePointerCapture() }
+-                .onChange(of: isShowingDiagnostics) { _, _ in updatePointerCapture() }
+-                .onChange(of: isConfirmingClose) { _, _ in updatePointerCapture() }
++                .onChange(of: isShowingControls) { _ in updatePointerCapture() }
++                .onChange(of: isShowingDiagnostics) { _ in updatePointerCapture() }
++                .onChange(of: isConfirmingClose) { _ in updatePointerCapture() }
+                 .onDisappear {
+                     deviceKeyboardVisible = false
+                     #if MADEIRA_RUNTIME
+@@ -463,7 +463,7 @@
+ 
+     private func showInputNotice(device: String, symbol: String, connected: Bool) {
+         let message = "\(device) \(connected ? "connected" : "disconnected")"
+-        withAnimation(reduceMotion ? .easeOut(duration: 0.15) : .smooth(duration: 0.3, extraBounce: 0)) {
++        withAnimation(reduceMotion ? .easeOut(duration: 0.15) : .easeInOut(duration: 0.3)) {
+             inputNoticeSymbol = symbol
+             inputNotice = message
+         }
+--- a/iridium/apps/ios/Iridium/Views/SettingsView.swift
++++ b/iridium/apps/ios/Iridium/Views/SettingsView.swift
+@@ -83,8 +83,8 @@
+         .iridiumListChrome(onBack: onBack)
+         .toolbar {
+             if let onBack {
+-                ToolbarItem(placement: .topBarLeading) {
+-                    Button("Library", systemImage: "chevron.backward", action: onBack)
++                ToolbarItem(placement: .navigationBarLeading) {
++                    IridiumSymbolButton("Library", systemImage: "chevron.backward", action: onBack)
+                         .labelStyle(.iconOnly).keyboardShortcut(.cancelAction)
+                 }
+             }
+--- /dev/null
++++ b/iridium/apps/ios/ios16-compile.yml
+@@ -0,0 +1,59 @@
++# Compile-only diagnostic. No executable, IPA, runtime implementation, or signing.
++name: IridiumIOS16Compile
++packages:
++  IridiumPackage:
++    path: ../..
++  AltKit:
++    url: https://github.com/rileytestut/AltKit.git
++    from: 0.0.2
++settings:
++  base:
++    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
++    SWIFT_VERSION: "5.10"
++    CODE_SIGNING_ALLOWED: NO
++    CLANG_ENABLE_MODULES: YES
++    ENABLE_USER_SCRIPT_SANDBOXING: NO
++targets:
++  MadeiraNative:
++    type: framework.static
++    platform: iOS
++    deploymentTarget: "16.0"
++    sources:
++      - path: MadeiraSupport/MadeiraNative.h
++        headerVisibility: public
++      - path: IOS16Compile/ModuleAnchor.c
++    settings:
++      base:
++        PRODUCT_BUNDLE_IDENTIFIER: software.iridium.compile-only.headers
++        GENERATE_INFOPLIST_FILE: YES
++  IridiumIOS16Compile:
++    type: library.static
++    platform: iOS
++    deploymentTarget: "16.0"
++    sources:
++      - path: Iridium
++        includes: ["**/*.swift"]
++      - path: MadeiraSupport
++        includes: ["*.swift"]
++      - path: ../../../testrepos/Madeira/app/Madeira
++        includes: [StikJITHelper.swift, LogStore.swift, LogTail.swift, LogPattern.swift]
++    settings:
++      base:
++        SWIFT_ACTIVE_COMPILATION_CONDITIONS: ["$(inherited)", MADEIRA_RUNTIME]
++        SWIFT_OBJC_BRIDGING_HEADER: MadeiraSupport/IridiumMadeira-Bridging-Header.h
++    dependencies:
++      - target: MadeiraNative
++        embed: false
++      - package: AltKit
++        product: AltKit
++      - package: IridiumPackage
++        product: IridiumCore
++      - package: IridiumPackage
++        product: IridiumRuntime
++      - package: IridiumPackage
++        product: IridiumProfiles
++schemes:
++  IridiumIOS16Compile:
++    build:
++      targets:
++        IridiumIOS16Compile: all
