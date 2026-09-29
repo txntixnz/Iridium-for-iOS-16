@@ -104,3 +104,29 @@
 +all existing upstream notices remain unchanged. The compile-only Swift probe
 +creates a resource marker when the generated runtime directory is absent; it
 +does not supply a runnable runtime. Native probe failures now print their logs.
+--- a/iridium/apps/ios/ios16-compile.yml
++++ b/iridium/apps/ios/ios16-compile.yml
+@@ -41,17 +41,23 @@
+       base:
+         SWIFT_ACTIVE_COMPILATION_CONDITIONS: ["$(inherited)", MADEIRA_RUNTIME]
+         SWIFT_OBJC_BRIDGING_HEADER: MadeiraSupport/IridiumMadeira-Bridging-Header.h
++    # Static-library defaults omit the Frameworks phase, hiding transitive C
++    # module maps from Swift. Explicit package links retain that build metadata.
+     dependencies:
+       - target: MadeiraNative
+         embed: false
+       - package: AltKit
+         product: AltKit
++        link: true
+       - package: IridiumPackage
+         product: IridiumCore
++        link: true
+       - package: IridiumPackage
+         product: IridiumRuntime
++        link: true
+       - package: IridiumPackage
+         product: IridiumProfiles
++        link: true
+ schemes:
+   IridiumIOS16Compile:
+     build:
