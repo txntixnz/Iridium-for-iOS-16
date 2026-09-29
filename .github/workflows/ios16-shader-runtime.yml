@@ -1,0 +1,55 @@
+name: iOS 16 shader runtime build
+'on':
+  workflow_dispatch: null
+permissions:
+  contents: read
+jobs:
+  shader-runtime:
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+    - name: Check out port patch
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        path: port
+        persist-credentials: false
+    - name: Check out matching upstream source
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: intraducine/iridium
+        ref: c5e759da30fd2547786ba7ea68657c611f6562c5
+        path: upstream
+        persist-credentials: false
+        submodules: false
+        lfs: false
+    - name: Verify source and apply iOS 16 patch
+      working-directory: upstream
+      run: |
+        test "$(git rev-parse HEAD)" = c5e759da30fd2547786ba7ea68657c611f6562c5
+        git apply --check --whitespace=error-all ../port/patches/ios16-checkpoint.patch
+        git apply ../port/patches/ios16-checkpoint.patch
+        git apply --check --whitespace=error-all ../port/patches/ios16-compiler-fixes.patch
+        git apply ../port/patches/ios16-compiler-fixes.patch
+        git diff --check
+        mkdir -p .build/ios16-diagnostics .build/ios16-native-diagnostics
+        git rev-parse HEAD > .build/ios16-diagnostics/source.log
+        git -C ../port rev-parse HEAD >> .build/ios16-diagnostics/source.log
+        shasum -a 256 ../port/patches/*.patch >> .build/ios16-diagnostics/source.log
+        cp .build/ios16-diagnostics/source.log .build/ios16-native-diagnostics/source.log
+    - name: Install build tools
+      run: brew install cmake ninja
+    - name: Build and link LLVM and the DXBC translator
+      working-directory: upstream
+      run: bash ../port/ci/check-ios16-shader-runtime.sh
+    - name: Retain shader runtime diagnostics
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: Iridium-iOS16-shader-runtime-diagnostics
+        path: |-
+          upstream/.build/ios16-shader-runtime/*.log
+          upstream/.build/ios16-shader-runtime/*.tsv
+          upstream/.build/ios16-shader-runtime/*.map
+          upstream/.build/ios16-diagnostics/source.log
+        if-no-files-found: warn
+        retention-days: 7
